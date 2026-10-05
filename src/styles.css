@@ -9,6 +9,15 @@ html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { background: #000; }
 canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
 
+/* Móvil: sin rebote al deslizar, sin zoom por doble toque, sin seleccionar texto */
+html, body {
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
 /* Único texto en pantalla al inicio: la invitación a reproducir. Desaparece al dar play. */
 #start {
   position: fixed;
@@ -30,13 +39,37 @@ canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
 /* Cursor oculto tras unos segundos de inactividad */
 body.idle, body.idle canvas, body.idle #start { cursor: none; }
 
-/* ---------- panel (tecla P) ---------- */
+/* ---------- botón del panel (reemplaza la tecla P en el celular) ---------- */
+#panelBtn {
+  position: fixed;
+  top: max(14px, env(safe-area-inset-top));
+  right: max(14px, env(safe-area-inset-right));
+  z-index: 11;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.16);
+  background: rgba(8, 10, 12, .6);
+  color: #fff;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+/* En PC con mouse queda casi invisible hasta que pasas el cursor */
+@media (hover: hover) and (pointer: fine) {
+  #panelBtn { opacity: .25; transition: opacity .2s ease; }
+  #panelBtn:hover { opacity: 1; }
+}
+
+/* ---------- panel (tecla P o botón ⚙) ---------- */
 .panel {
   position: fixed;
   top: 14px;
   left: 14px;
   width: min(340px, calc(100vw - 28px));
   max-height: calc(100vh - 28px);
+  max-height: calc(100dvh - 28px); /* en móvil descuenta la barra del navegador */
   overflow: auto;
   padding: 14px;
   border: 1px solid rgba(255,255,255,.16);
@@ -46,7 +79,7 @@ body.idle, body.idle canvas, body.idle #start { cursor: none; }
   z-index: 10;
 }
 
-.panel h1 { font-size: 16px; margin: 0 0 4px; }
+.panel h1 { font-size: 16px; margin: 0 0 4px; padding-right: 48px; /* deja libre el botón ⚙ */ }
 .panel h2 { font-size: 12px; margin: 16px 0 8px; text-transform: uppercase; letter-spacing: .08em; opacity: .72; }
 .panel p, .panel li { font-size: 12px; line-height: 1.4; color: #c9cdd2; }
 .panel .row { margin: 8px 0; }
@@ -66,6 +99,12 @@ body.idle, body.idle canvas, body.idle #start { cursor: none; }
 .panel .value { font-variant-numeric: tabular-nums; opacity: .85; }
 .panel .group { padding-top: 4px; border-top: 1px solid rgba(255,255,255,.08); }
 .panel.hidden { display: none; }
+
+/* En pantallas táctiles, controles un poco más grandes */
+@media (pointer: coarse) {
+  .panel button { padding: 12px 10px; }
+  .panel input[type="range"] { height: 28px; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   #start { transition: none; }

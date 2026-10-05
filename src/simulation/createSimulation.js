@@ -62,18 +62,20 @@ export function createSimulation({ canvas, params }) {
 
   // ============================================================
   //  FOCAS: 2 a la izquierda, 2 a la derecha (centro = fracción de la pantalla)
+  //  fx, fy → posición en pantalla horizontal (PC)
+  //  px, py → posición en pantalla vertical (celular)
   // ============================================================
 
   // bias: desfase de sensibilidad, para que no abran todas exactamente a la vez
   // mouth: 0–1 suavizado de "qué tan abierta está", lo usan los hilos y los halos
-  const makeSeal = (side, fx, fy, bias) => ({
-    side, fx, fy, bias, open: false, timer: 0, stretch: 0, stretchVel: 0, mouth: 0
+  const makeSeal = (side, fx, fy, px, py, bias) => ({
+    side, fx, fy, px, py, bias, open: false, timer: 0, stretch: 0, stretchVel: 0, mouth: 0
   });
   const seals = [
-    makeSeal('left', 0.1, 0.3, 0.0),
-    makeSeal('left', 0.1, 0.72, 0.08),
-    makeSeal('right', 0.9, 0.3, 0.04),
-    makeSeal('right', 0.9, 0.72, 0.12)
+    makeSeal('left', 0.1, 0.3, 0.2, 0.1, 0.0),
+    makeSeal('left', 0.1, 0.72, 0.2, 0.9, 0.08),
+    makeSeal('right', 0.9, 0.3, 0.8, 0.1, 0.04),
+    makeSeal('right', 0.9, 0.72, 0.8, 0.9, 0.12)
   ];
 
   // ============================================================
@@ -283,12 +285,18 @@ export function createSimulation({ canvas, params }) {
 
   function sealLayout() {
     const minDim = Math.min(width, heightPx);
-    // Cuadro de cada foca: nunca más ancho que el 20 % de la pantalla ni más alto que el 40 %
-    const box = Math.min(minDim * params.sealScale, width * 0.2, heightPx * 0.4);
+    const portrait = heightPx > width; // celular en vertical
+    // Cuadro de cada foca. En horizontal: nunca más ancho que el 20 % de la pantalla ni más
+    // alto que el 40 %. En vertical: más grandes y repartidas arriba y abajo.
+    const box = portrait
+      ? Math.min(width * 0.36, heightPx * 0.2)
+      : Math.min(minDim * params.sealScale, width * 0.2, heightPx * 0.4);
     const margin = minDim * 0.02;
     const items = seals.map((seal) => {
-      const cx = clamp(seal.fx * width, box / 2 + margin, width - box / 2 - margin);
-      const cy = clamp(seal.fy * heightPx, box / 2 + margin, heightPx - box / 2 - margin);
+      const fxp = portrait ? seal.px : seal.fx;
+      const fyp = portrait ? seal.py : seal.fy;
+      const cx = clamp(fxp * width, box / 2 + margin, width - box / 2 - margin);
+      const cy = clamp(fyp * heightPx, box / 2 + margin, heightPx - box / 2 - margin);
       return { seal, cx, cy, baseY: cy + box / 2 };
     });
     return { box, items };

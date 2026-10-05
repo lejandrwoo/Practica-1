@@ -8,6 +8,7 @@ const DEBUG = new URLSearchParams(location.search).has('debug');
 
 const canvas = document.querySelector('#stage');
 const startMessage = document.querySelector('#start');
+const panelBtn = document.querySelector('#panelBtn');
 
 const params = createParameters();
 const simulation = createSimulation({ canvas, params });
@@ -182,7 +183,7 @@ let lastChange = -Infinity;
 
 const toggleFullscreen = () => {
   if (document.fullscreenElement) document.exitFullscreen();
-  else document.documentElement.requestFullscreen?.();
+  else document.documentElement.requestFullscreen?.(); // en iPhone/Safari no existe: no hace nada
 };
 
 panel = createLabPanel({
@@ -195,6 +196,18 @@ panel = createLabPanel({
     beatCount = 0;
   },
   onFullscreen: toggleFullscreen
+});
+
+// Texto de inicio según el dispositivo (táctil o PC)
+const isTouch = matchMedia('(pointer: coarse)').matches;
+startMessage.textContent = isTouch
+  ? 'Toca la pantalla para reproducir'
+  : 'Haz clic o pulsa Espacio para reproducir\nP: panel · M: orden de monos · F: pantalla completa';
+
+// Botón ⚙: abre y cierra el panel (reemplaza la tecla P en el celular)
+panelBtn.addEventListener('click', (event) => {
+  event.stopPropagation(); // que no cuente como play/pausa
+  panel.setVisible(!panel.isVisible());
 });
 
 // Reproducir desde el lienzo o con la tecla Espacio
@@ -232,6 +245,14 @@ addEventListener('keydown', (event) => {
 addEventListener('resize', () => {
   simulation.resize();
   simulation.draw();
+});
+
+// Al girar el celular, el tamaño real tarda un instante en actualizarse
+addEventListener('orientationchange', () => {
+  setTimeout(() => {
+    simulation.resize();
+    simulation.draw();
+  }, 250);
 });
 
 // El cursor se oculta solo tras unos segundos sin moverse

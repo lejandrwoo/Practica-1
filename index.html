@@ -2,7 +2,7 @@
 <html lang="es">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <title>Monos al ritmo</title>
   </head>
@@ -10,8 +10,8 @@
     <div id="app">
       <canvas id="stage"></canvas>
     </div>
-    <div id="start">Haz clic o pulsa Espacio para reproducir
-P: panel · M: orden de monos · F: pantalla completa</div>
+    <button id="panelBtn" aria-label="Ajustes">⚙</button>
+    <div id="start"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
