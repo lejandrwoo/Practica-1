@@ -1,14 +1,36 @@
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   color: #f2f2f2;
-  background: #050607;
+  background: #000;
 }
 
 * { box-sizing: border-box; }
 html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-body { background: #050607; }
-canvas { display: block; width: 100%; height: 100%; }
+body { background: #000; }
+canvas { display: block; width: 100%; height: 100%; cursor: pointer; }
 
+/* Único texto en pantalla al inicio: la invitación a reproducir. Desaparece al dar play. */
+#start {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: end center;
+  gap: 8px;
+  padding: 24px 24px 8vh;
+  text-align: center;
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-line;
+  color: #8a8a8a;
+  cursor: pointer;
+  transition: opacity 0.4s ease;
+}
+#start.hidden { opacity: 0; pointer-events: none; }
+
+/* Cursor oculto tras unos segundos de inactividad */
+body.idle, body.idle canvas, body.idle #start { cursor: none; }
+
+/* ---------- panel (tecla P) ---------- */
 .panel {
   position: fixed;
   top: 14px;
@@ -30,7 +52,6 @@ canvas { display: block; width: 100%; height: 100%; }
 .panel .row { margin: 8px 0; }
 .panel label { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
 .panel input[type="range"] { width: 100%; }
-.panel input[type="checkbox"] { transform: translateY(1px); }
 .panel button, .panel select {
   width: 100%;
   margin-top: 6px;
@@ -39,23 +60,13 @@ canvas { display: block; width: 100%; height: 100%; }
   border: 1px solid rgba(255,255,255,.18);
   background: rgba(255,255,255,.08);
   color: inherit;
+  cursor: pointer;
 }
 .panel button:hover { background: rgba(255,255,255,.14); }
 .panel .value { font-variant-numeric: tabular-nums; opacity: .85; }
 .panel .group { padding-top: 4px; border-top: 1px solid rgba(255,255,255,.08); }
 .panel.hidden { display: none; }
 
-.hud {
-  position: fixed;
-  right: 14px;
-  bottom: 14px;
-  z-index: 9;
-  padding: 8px 10px;
-  border-radius: 9px;
-  background: rgba(8,10,12,.7);
-  font-size: 11px;
-  color: #d8dce0;
-  line-height: 1.45;
-  pointer-events: none;
+@media (prefers-reduced-motion: reduce) {
+  #start { transition: none; }
 }
-.hud strong { color: white; }

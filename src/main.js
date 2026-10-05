@@ -1,302 +1,300 @@
-import * as THREE from 'three/webgpu';
-import WebGPU from 'three/addons/capabilities/WebGPU.js';
 import './styles.css';
 
-import { createParameters, PRESET_LIST } from './simulation/parameters.js';
+import { createParameters } from './simulation/parameters.js';
 import { createSimulation } from './simulation/createSimulation.js';
 import { createLabPanel } from './ui/labPanel.js';
 
-// Más agentes = más detalle, más carga. Prueba: ?agents=131072 en GPUs modestas.
-const COUNT = Number(new URLSearchParams(location.search).get('agents')) || 262144;
-const GRID_H = 720;
-const STEP = 1 / 60; // la simulación avanza a 60 Hz fijos, sea cual sea el monitor
+const DEBUG = new URLSearchParams(location.search).has('debug');
 
-async function main() {
-  const mount = document.querySelector('#app');
+const canvas = document.querySelector('#stage');
+const startMessage = document.querySelector('#start');
 
-  if (!WebGPU.isAvailable()) {
-    mount.appendChild(WebGPU.getErrorMessage());
-    throw new Error('Este proyecto requiere WebGPU.');
+const params = createParameters();
+const simulation = createSimulation({ canvas, params });
+
+// ---------------- DETECTOR DE GOLPES ----------------
+// Flujo espectral: mide cuánto SUBE la energía de una banda de un frame al siguiente y lo
+// compara con el flujo reciente (media + k·desviación). Se adapta solo al volumen.
+class OnsetDetector {
+  constructor(getConfig, historySize = 45) {
+    this.getConfig = getConfig; // () => { sensitivity, minFlux, cooldown } (se lee en vivo)
+    this.history = new Float32Array(historySize);
+    this.cursor = 0;
+    this.filled = 0;
+    this.prev = 0;
+    this.last = -Infinity;
   }
 
-  const scene = new THREE.Scene();
-  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
-  camera.position.z = 1;
+  // Devuelve 0 si no hay golpe, o su fuerza (0.4–1) si lo hay
+  update(value, now) {
+    const { sensitivity, minFlux, cooldown } = this.getConfig();
+    const flux = Math.max(0, value - this.prev);
+    this.prev = value;
 
-  const renderer = new THREE.WebGPURenderer({ antialias: false });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
-  renderer.setSize(innerWidth, innerHeight);
-  mount.appendChild(renderer.domElement);
-  await renderer.init();
+    const n = this.filled;
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += this.history[i];
+    mean = n ? mean / n : 0;
+    let variance = 0;
+    for (let i = 0; i < n; i++) variance += (this.history[i] - mean) ** 2;
+    const std = n ? Math.sqrt(variance / n) : 0;
 
-  // El mapa de rastro respeta la proporción de la ventana
-  const gridW = Math.min(2200, Math.max(640, Math.round(GRID_H * (innerWidth / innerHeight))));
+    const threshold = Math.max(mean + sensitivity * std, minFlux);
 
-  const params = createParameters();
-  const simulation = createSimulation({
-    renderer,
-    scene,
-    params,
-    count: COUNT,
-    gridWidth: gridW,
-    gridHeight: GRID_H
-  });
+    this.history[this.cursor] = flux;
+    this.cursor = (this.cursor + 1) % this.history.length;
+    this.filled = Math.min(this.filled + 1, this.history.length);
 
-  // ---------------- AUDIO ----------------
-  let audioContext, analyser, dataArray, audioEl;
-  let isAudioPlaying = false;
-  let panel;
-
-  const toggleAudio = () => {
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      // BASE_URL respeta la subcarpeta de GitHub Pages (/porter-robinson/) y también funciona en local
-      audioEl = new Audio(import.meta.env.BASE_URL + 'sea-of-voices-audio.mp3');
-      audioEl.crossOrigin = 'anonymous';
-      audioEl.loop = true;
-
-      const source = audioContext.createMediaElementSource(audioEl);
-      analyser = audioContext.createAnalyser();
-      analyser.fftSize = 1024; // 512 bins de ~43 Hz: graves, medios y agudos bien separados
-      analyser.smoothingTimeConstant = 0.55;
-      source.connect(analyser);
-      analyser.connect(audioContext.destination);
-      dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-      audioEl.addEventListener('timeupdate', () => {
-        panel?.updateAudioTime(audioEl.currentTime, audioEl.duration);
-      });
+    if (flux > threshold && now - this.last > cooldown) {
+      this.last = now;
+      return Math.min(1, Math.max(0.4, flux / (threshold * 2)));
     }
+    return 0;
+  }
+}
 
-    if (audioContext.state === 'suspended') audioContext.resume();
+const kickDetector = new OnsetDetector(() => ({
+  sensitivity: params.kickSensitivity,
+  minFlux: params.kickMinFlux,
+  cooldown: params.kickCooldown
+}));
+const voiceDetector = new OnsetDetector(() => ({
+  sensitivity: params.voiceSensitivity,
+  minFlux: params.voiceMinFlux,
+  cooldown: params.voiceCooldown
+}));
 
-    if (audioEl.paused) {
-      audioEl.play();
-      isAudioPlaying = true;
-      return true;
-    }
-    audioEl.pause();
-    isAudioPlaying = false;
-    return false;
-  };
+// ---------------- AUDIO ----------------
+let audioContext, analyser, dataArray, timeArray, audioEl;
+let binHz = 1;
+let panel;
 
-  const seekAudio = (percent) => {
-    if (audioEl && audioEl.duration) audioEl.currentTime = (percent / 100) * audioEl.duration;
-  };
+const env = { bass: 0, voice: 0 }; // envolventes: ataque instantáneo, caída suave
+let voiceSlow = 0; // promedio lento de la voz, para saber cuándo "destaca"
+let warmup = 0; // segundos sin detección tras dar play (evita un falso golpe)
 
-  const bandAverage = (from, to) => {
-    let sum = 0;
-    for (let i = from; i < to; i++) sum += dataArray[i];
-    return sum / (to - from);
-  };
+const isAudioPlaying = () => !!audioEl && !audioEl.paused;
 
-  // Envolvente con ataque instantáneo y caída suave, para que no parpadee
-  const env = { bass: 0, mid: 0, high: 0 };
+function initAudio() {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  // BASE_URL respeta la subcarpeta de GitHub Pages y también funciona en local
+  audioEl = new Audio(import.meta.env.BASE_URL + params.audioFile);
+  audioEl.crossOrigin = 'anonymous';
+  audioEl.loop = true;
 
-  // Detector de golpes por banda: el valor actual supera su promedio reciente.
-  const onsets = {
-    bass: { avg: 0, last: 0, ratio: 1.2, floor: 0.05, cooldown: 0.22 },
-    mid: { avg: 0, last: 0, ratio: 1.25, floor: 0.06, cooldown: 0.35 },
-    high: { avg: 0, last: 0, ratio: 1.35, floor: 0.06, cooldown: 0.18 }
-  };
-  const detect = (key, value, delta, now) => {
-    const st = onsets[key];
-    const hit = value > st.avg * st.ratio + st.floor && now - st.last > st.cooldown;
-    st.avg += (value - st.avg) * Math.min(delta * 1.5, 1);
-    if (!hit) return 0;
-    st.last = now;
-    return Math.min(1, value - st.avg + 0.3); // fuerza del golpe, 0.3–1
-  };
+  const source = audioContext.createMediaElementSource(audioEl);
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.4; // poco suavizado: los golpes se notan más
+  analyser.minDecibels = -90;
+  analyser.maxDecibels = -20;
+  source.connect(analyser);
+  analyser.connect(audioContext.destination);
 
-  // "Brillo" del sonido (centroide espectral): sube o baja según la melodía/armonía.
-  let centroidFast = 0.5;
-  let centroidSlow = 0.5;
-  const spectralCentroid = () => {
-    let num = 0, den = 0;
-    for (let i = 1; i < 250; i++) {
-      num += i * dataArray[i];
-      den += dataArray[i];
-    }
-    return den > 0 ? Math.min(Math.log2(1 + num / den) / Math.log2(250), 1) : 0.5;
-  };
+  dataArray = new Uint8Array(analyser.frequencyBinCount); // espectro
+  timeArray = new Uint8Array(analyser.fftSize); // forma de onda (la dibujan los hilos)
+  binHz = audioContext.sampleRate / analyser.fftSize;
 
-  // Tempo: mediana del intervalo entre bombos → 70–180 BPM se mapea a 0.75–1.35
-  const kickTimes = [];
-  let tempoSmooth = 1;
-  const updateTempo = (delta, now, playing) => {
-    while (kickTimes.length && now - kickTimes[0] > 6) kickTimes.shift();
-    let target = 1;
-    if (playing && kickTimes.length >= 4) {
-      const gaps = [];
-      for (let i = 1; i < kickTimes.length; i++) gaps.push(kickTimes[i] - kickTimes[i - 1]);
-      gaps.sort((a, b) => a - b);
-      let bpm = 60 / Math.max(gaps[Math.floor(gaps.length / 2)], 0.05);
-      while (bpm > 180) bpm /= 2;
-      while (bpm < 70) bpm *= 2;
-      target = 0.75 + ((bpm - 70) / 110) * 0.6;
-    }
-    tempoSmooth += (target - tempoSmooth) * Math.min(delta * 0.5, 1); // cambia despacio (~2 s)
-    params.tempo.value = tempoSmooth;
-  };
-
-  const analyseAudio = (delta, now) => {
-    let bass = 0, mid = 0, high = 0;
-    const playing = isAudioPlaying && analyser;
-
-    if (playing) {
-      analyser.getByteFrequencyData(dataArray);
-      bass = Math.min(bandAverage(1, 7) / 160, 1); //    ~45–300 Hz
-      mid = Math.min(bandAverage(7, 60) / 140, 1); //    ~300 Hz–2.6 kHz
-      high = Math.min(bandAverage(60, 250) / 110, 1); // ~2.6–10 kHz
-    }
-
-    const release = Math.exp(-delta * 6);
-    env.bass = Math.max(bass, env.bass * release);
-    env.mid = Math.max(mid, env.mid * release);
-    env.high = Math.max(high, env.high * release);
-
-    params.audioBass.value = env.bass;
-    params.audioMid.value = env.mid;
-    params.audioHigh.value = env.high;
-    params.songEnergy.value = env.bass * 0.5 + env.mid * 0.3 + env.high * 0.2;
-
-    const kick = detect('bass', bass, delta, now);
-    const melody = detect('mid', mid, delta, now);
-    const hat = detect('high', high, delta, now);
-
-    if (kick) kickTimes.push(now);
-    updateTempo(delta, now, playing);
-
-    if (!playing) return;
-
-    // Los efectos que antes daban W A S D, ahora los da la canción (suaves):
-    //   S · pulso de onda      ← golpe de bajo (bombo)
-    //   W · sacudida de rumbo  ← transitorios agudos (hi-hat, caja) y bombos fuertes
-    //   D · remolino           ← golpes en los medios (voz, melodía)
-    //   A · giro del campo     ← movimiento del brillo del sonido (sube/baja la armonía)
-    if (kick) {
-      params.firePulse(0.5 + kick * 0.8);
-      params.hitBeat(0.7 + kick * 0.6);
-      params.keyboardChaos.value = Math.max(params.keyboardChaos.value, 0.12 + kick * 0.2);
-    }
-    if (hat) {
-      params.keyboardChaos.value = Math.max(params.keyboardChaos.value, 0.15 + hat * 0.3);
-      params.hitSnap(0.5 + hat * 0.5);
-    }
-    if (melody) {
-      params.keyboardWarp.value = Math.max(params.keyboardWarp.value, 0.3 + melody * 0.5);
-      params.hitSnap(0.35 + melody * 0.4);
-    }
-
-    centroidFast += (spectralCentroid() - centroidFast) * Math.min(delta * 6, 1);
-    centroidSlow += (centroidFast - centroidSlow) * Math.min(delta * 0.8, 1);
-    const drift = centroidFast - centroidSlow; // >0 el sonido se vuelve más agudo
-    params.keyboardRotation.value += drift * delta * 14;
-    if (melody) params.keyboardRotation.value += Math.sign(drift || 1) * (0.1 + melody * 0.25);
-  };
-
-  // ---------------- PUNTERO ----------------
-  addEventListener('pointermove', (event) => {
-    params.pointer.value.set(
-      (event.clientX / innerWidth) * simulation.gridWidth,
-      (1 - event.clientY / innerHeight) * simulation.gridHeight
-    );
-  });
-  document.addEventListener('mouseleave', () => params.pointer.value.set(-10000, -10000));
-
-  // ---------------- ESTADO / UI ----------------
-  let paused = false;
-  let mode = 'LAB';
-  const hud = document.createElement('div');
-  hud.className = 'hud';
-  document.body.append(hud);
-
-  const applyPreset = (index) => {
-    params.applyPreset(index);
-    panel?.refresh();
-    panel?.setActivePreset(index);
-  };
-
-  const setMode = (next) => {
-    mode = next;
-    const lab = mode === 'LAB';
-    panel.setVisible(lab);
-    // En PERFORMANCE se oculta el cursor (también sobre el canvas)
-    const cursor = lab ? '' : 'none';
-    document.body.style.cursor = cursor;
-    renderer.domElement.style.cursor = cursor;
-    hud.innerHTML = lab
-      ? '<b>PHYSARUM WAVES</b> · 1-6: visuales · P: performance · Espacio: repeler'
-      : '';
-  };
-
-  panel = createLabPanel({
-    params,
-    onReset: () => simulation.reset(),
-    onPreset: applyPreset,
-    onModeChange: () => setMode(mode === 'LAB' ? 'PERFORMANCE' : 'LAB'),
-    onPauseChange: () => (paused = !paused),
-    onToggleAudio: toggleAudio,
-    onSeekAudio: seekAudio
-  });
-  panel.setActivePreset(params.getActivePreset());
-  setMode('LAB');
-
-  // ---------------- TECLADO ----------------
-  addEventListener('keydown', (event) => {
-    if (event.repeat) return;
-    const code = event.code;
-
-    if (code === 'KeyP') setMode(mode === 'LAB' ? 'PERFORMANCE' : 'LAB');
-    if (code === 'KeyR') simulation.reset();
-
-    // 1–6 → cada visual (teclado normal y numérico)
-    const match = /^(?:Digit|Numpad)([1-9])$/.exec(code);
-    if (match) {
-      const index = Number(match[1]) - 1;
-      if (index < PRESET_LIST.length) applyPreset(index);
-    }
-
-
-    if (code === 'Space') {
-      event.preventDefault();
-      params.brushSign.value = -1; // el puntero repele mientras se mantiene
-    }
-  });
-
-  addEventListener('keyup', (event) => {
-    if (event.code === 'Space') params.brushSign.value = 1;
-  });
-
-  addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
-
-  // ---------------- LOOP ----------------
-  simulation.reset();
-  const clock = new THREE.Clock();
-  let accumulator = 0;
-
-  renderer.setAnimationLoop(() => {
-    const delta = Math.min(clock.getDelta(), 0.1);
-    const now = clock.elapsedTime;
-
-    analyseAudio(delta, now);
-    params.updateLerp(delta);
-
-    if (!paused) {
-      accumulator += delta;
-      let steps = 0;
-      while (accumulator >= STEP && steps < 3) {
-        simulation.stepSimulation();
-        accumulator -= STEP;
-        steps++;
-      }
-      if (steps === 3) accumulator = 0;
-    }
-
-    renderer.render(scene, camera);
+  audioEl.addEventListener('timeupdate', () => {
+    panel?.updateAudioTime(audioEl.currentTime, audioEl.duration);
   });
 }
 
-main().catch((error) => {
-  console.error(error);
+// Debe llamarse desde un gesto del usuario. Devuelve true si queda sonando.
+async function toggleAudio() {
+  if (!ready) return false;
+  try {
+    if (!audioContext) initAudio();
+    if (audioContext.state === 'suspended') await audioContext.resume();
+
+    if (audioEl.paused) {
+      warmup = 0.15;
+      await audioEl.play();
+      startMessage.classList.add('hidden');
+      return true;
+    }
+    audioEl.pause();
+    return false;
+  } catch (error) {
+    console.error(error);
+    startMessage.classList.remove('hidden');
+    startMessage.textContent = `No se pudo reproducir ${params.audioFile} (revisa que esté en /public).`;
+    return false;
+  }
+}
+
+const seekAudio = (percent) => {
+  if (audioEl && audioEl.duration) audioEl.currentTime = (percent / 100) * audioEl.duration;
+};
+
+const bandLevel = (fromHz, toHz) => {
+  const from = Math.max(1, Math.round(fromHz / binHz));
+  const to = Math.min(dataArray.length, Math.max(from + 1, Math.round(toHz / binHz)));
+  let sum = 0;
+  for (let i = from; i < to; i++) sum += dataArray[i];
+  return sum / (to - from) / 255;
+};
+
+// Devuelve: bass / voice (0–1, envolventes), kick / voiceHit (0, o fuerza 0.4–1)
+function analyseAudio(dt, now) {
+  let bass = 0;
+  let voice = 0;
+  let kick = 0;
+  let wave = null; // forma de onda actual (solo mientras suena)
+  let voiceHit = 0;
+  let voiceRel = 0; // voz actual ÷ su promedio reciente: >1 = la voz destaca, <1 = baja
+
+  if (isAudioPlaying() && analyser) {
+    analyser.getByteFrequencyData(dataArray);
+    analyser.getByteTimeDomainData(timeArray);
+    wave = timeArray;
+    bass = bandLevel(params.bassLow, params.bassHigh);
+    voice = bandLevel(params.voiceLow, params.voiceHigh);
+
+    if (warmup > 0) {
+      // Recién dado play: el promedio se iguala a la voz actual para no abrir bocas de más
+      voiceSlow = voice;
+      warmup = Math.max(0, warmup - dt);
+    } else {
+      voiceSlow += (voice - voiceSlow) * Math.min(dt * 0.5, 1);
+    }
+    voiceRel = voiceSlow > 0.01 ? voice / voiceSlow : 0;
+
+    if (warmup === 0) {
+      kick = kickDetector.update(bass, now);
+      const voiceFlux = voiceDetector.update(voice, now);
+      // Solo salta con la voz si de verdad está por encima de su nivel habitual
+      if (voiceFlux && voice > voiceSlow * params.voiceProminence) voiceHit = voiceFlux;
+    }
+  }
+
+  const release = Math.exp(-dt * 8);
+  env.bass = Math.max(bass, env.bass * release);
+  env.voice = Math.max(voice, env.voice * release);
+
+  return { bass: env.bass, voice: env.voice, voiceRel, kick, voiceHit, wave };
+}
+
+// ---------------- UI ----------------
+let ready = false;
+let beatCount = 0;
+let lastChange = -Infinity;
+
+const toggleFullscreen = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.();
+};
+
+panel = createLabPanel({
+  params,
+  onToggleAudio: toggleAudio,
+  onSeekAudio: seekAudio,
+  onToggleOrder: () => simulation.toggleOrder(),
+  onReset: () => {
+    simulation.reset();
+    beatCount = 0;
+  },
+  onFullscreen: toggleFullscreen
 });
+
+// Reproducir desde el lienzo o con la tecla Espacio
+const togglePlayback = async () => {
+  const playing = await toggleAudio();
+  panel.setPlaying(playing);
+};
+
+canvas.addEventListener('click', togglePlayback);
+startMessage.addEventListener('click', togglePlayback);
+
+// ---------------- TECLADO ----------------
+addEventListener('keydown', (event) => {
+  if (event.repeat) return;
+  const code = event.code;
+
+  if (code === 'Space') {
+    // Dentro del panel, Espacio ya activa el botón enfocado
+    if (event.target.closest?.('.panel')) return;
+    event.preventDefault();
+    togglePlayback();
+  }
+  if (code === 'KeyP') panel.setVisible(!panel.isVisible());
+  if (code === 'KeyM') {
+    simulation.toggleOrder();
+    panel.refresh();
+  }
+  if (code === 'KeyF') toggleFullscreen();
+  if (code === 'KeyR') {
+    simulation.reset();
+    beatCount = 0;
+  }
+});
+
+addEventListener('resize', () => {
+  simulation.resize();
+  simulation.draw();
+});
+
+// El cursor se oculta solo tras unos segundos sin moverse
+let cursorTimer;
+addEventListener('pointermove', () => {
+  document.body.classList.remove('idle');
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => document.body.classList.add('idle'), 2000);
+});
+
+// ---------------- CARGA DE IMÁGENES ----------------
+simulation
+  .load()
+  .then(() => {
+    ready = true;
+    simulation.draw();
+  })
+  .catch((error) => {
+    console.error(error);
+    startMessage.textContent = 'No se encontraron las imágenes en /public (1.png … 10.png).';
+  });
+
+// ---------------- LOOP ----------------
+let last = performance.now() / 1000;
+
+function frame(time) {
+  const now = time / 1000;
+  const dt = Math.min(now - last, 1 / 30);
+  last = now;
+
+  const audio = analyseAudio(dt, now);
+
+  // Bombo fuerte: salta hacia un punto nuevo de la pantalla (lejos, cerca, a un lado...)
+  // y, cada N bombos, cambia de mono
+  if (audio.kick) {
+    beatCount++;
+
+    const moveEvery = Math.round(params.beatsPerMove);
+    const travels = moveEvery > 0 && beatCount % moveEvery === 0;
+    if (travels) simulation.hop(audio.kick);
+    else simulation.jump(audio.kick);
+    // Onda de choque en el suelo (más grande cuando el mono viaja a otro punto)
+    simulation.beat(audio.kick, travels);
+
+    const changeEvery = Math.max(1, Math.round(params.beatsPerChange));
+    if (beatCount % changeEvery === 0 && now - lastChange > params.minChangeInterval) {
+      simulation.next();
+      lastChange = now;
+    }
+  }
+
+  // Voz destacada: salto menor en el sitio + balanceo + pequeño deslizamiento lateral
+  if (audio.voiceHit) {
+    simulation.jump(audio.voiceHit, params.voiceFactor);
+    simulation.wiggle(audio.voiceHit);
+    simulation.drift(audio.voiceHit);
+  }
+
+  simulation.update(dt, audio);
+  simulation.draw(audio);
+  if (DEBUG) simulation.drawDebug(audio);
+
+  requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
